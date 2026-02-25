@@ -1,66 +1,123 @@
-import altair as alt
-import pandas as pd
 import streamlit as st
+import requests
+import pandas as pd
+import re
+import io
 
-# Show the page title and description.
-st.set_page_config(page_title="Movies dataset", page_icon="🎬")
-st.title("🎬 Movies dataset")
-st.write(
-    """
-    This app visualizes data from [The Movie Database (TMDB)](https://www.kaggle.com/datasets/tmdb/tmdb-movie-metadata).
-    It shows which movie genre performed best at the box office over the years. Just 
-    click on the widgets below to explore!
-    """
-)
+# --- FUNÇÕES DE UTILIDADE ---
+def clean_text(text):
+    if isinstance(text, str):
+        return re.sub(r'[^ -~]', '', text)
+    return text
 
+def gera_token_wms(client_id, client_secret):
+    url = "https://supply.rac.totvs.app/totvs.rac/connect/token"
+    data = {
+        "client_id": client_id, 
+        "client_secret": client_secret,
+        "grant_type": "client_credentials", 
+        "scope": "authorization_api"
+    }
+    try:
+        res = requests.post(url, data=data, timeout=15)
+        return res.json().get("access_token") if res.status_code == 200 else None
+    except:
+        return None
 
-# Load the data from a CSV. We're caching this so it doesn't reload every time the app
-# reruns (e.g. if the user interacts with the widgets).
-@st.cache_data
-def load_data():
-    df = pd.read_csv("data/movies_genres_summary.csv")
-    return df
+# --- INTERFACE STREAMLIT ---
+st.set_page_config(page_title="WMS Address Query", layout="wide")
+st.title("📍 Consulta de Endereços e Depósitos WMS")
 
+with st.sidebar:
+    st.header("🔑 Credenciais WMS")
+    c_id = st.text_input("Client ID", type="password", key="addr_cid")
+    c_secret = st.text_input("Client Secret", type="password", key="addr_sec")
+    
+    st.divider()
+    
+    st.header("📍 Localização")
+    u_id = st.text_input("Unidade ID (UUID)", placeholder="Ex: ac275b55-90f8-44b8-b8cb-bdcfca969526", key="addr_uid")
+    
+    st.caption("🔒 Dados protegidos por sessão.")
 
-df = load_data()
+# --- BOTÃO DE EXECUÇÃO ---
+if st.button("🚀 Consultar Endereços"):
+    if not all([c_id, c_secret, u_id]):
+        st.error("⚠️ Por favor, preencha todos os campos na barra lateral.")
+    else:
+        token = gera_token_wms(c_id, c_secret)
+        
+        if not token:
+            st.error("❌ Falha na autenticação. Verifique o Client ID e Secret.")
+        else:
+            all_data = []
+            page = 1
+            progress_text = st.empty()
+            
+            API_URL = "https://supply.logistica.totvs.app/wms/query/api/v1/enderecos"
 
-# Show a multiselect widget with the genres using `st.multiselect`.
-genres = st.multiselect(
-    "Genres",
-    df.genre.unique(),
-    ["Action", "Adventure", "Biography", "Comedy", "Drama", "Horror"],
-)
+            with st.spinner("Mapeando endereços..."):
+                while True:
+                    params = {
+                        "page": page, 
+                        "pageSize": 500, 
+                        "unidadeId": u_id.strip()
+                    }
+                    
+                    try:
+                        headers = {"Authorization": f"Bearer {token}"}
+                        res = requests.get(API_URL, params=params, headers=headers, timeout=60)
+                        
+                        if res.status_code == 200:
+                            data = res.json()
+                            items = data.get('items', [])
+                            
+                            if not items:
+                                break
+                            
+                            for endereco in items:
+                                dados_deposito = endereco.get('deposito', {}) or {}
+                                
+                                all_data.append({
+                                    'ID Endereço': clean_text(endereco.get('id')),
+                                    'Descrição Endereço': clean_text(endereco.get('descricao')),
+                                    'Código de Barras': clean_text(endereco.get('codigoBarras')),
+                                    'Depósito': clean_text(dados_deposito.get('descricao')),
+                                    'ID Depósito': clean_text(dados_deposito.get('id')),
+                                    'Situação': clean_text(endereco.get('situacao'))
+                                })
+                            
+                            progress_text.info(f"⏳ Lendo página {page}... {len(all_data)} endereços mapeados.")
+                            
+                            if not data.get('hasNext'):
+                                break
+                            page += 1
+                        else:
+                            st.error(f"Erro na API (Página {page}): Status {res.status_code}")
+                            break
+                    except Exception as e:
+                        st.error(f"Erro de conexão: {e}")
+                        break
 
-# Show a slider widget with the years using `st.slider`.
-years = st.slider("Years", 1986, 2006, (2000, 2016))
-
-# Filter the dataframe based on the widget input and reshape it.
-df_filtered = df[(df["genre"].isin(genres)) & (df["year"].between(years[0], years[1]))]
-df_reshaped = df_filtered.pivot_table(
-    index="year", columns="genre", values="gross", aggfunc="sum", fill_value=0
-)
-df_reshaped = df_reshaped.sort_values(by="year", ascending=False)
-
-
-# Display the data as a table using `st.dataframe`.
-st.dataframe(
-    df_reshaped,
-    use_container_width=True,
-    column_config={"year": st.column_config.TextColumn("Year")},
-)
-
-# Display the data as an Altair chart using `st.altair_chart`.
-df_chart = pd.melt(
-    df_reshaped.reset_index(), id_vars="year", var_name="genre", value_name="gross"
-)
-chart = (
-    alt.Chart(df_chart)
-    .mark_line()
-    .encode(
-        x=alt.X("year:N", title="Year"),
-        y=alt.Y("gross:Q", title="Gross earnings ($)"),
-        color="genre:N",
-    )
-    .properties(height=320)
-)
-st.altair_chart(chart, use_container_width=True)
+            if all_data:
+                progress_text.empty()
+                df = pd.DataFrame(all_data)
+                
+                st.success(f"✅ Sucesso! {len(all_data)} endereços carregados.")
+                
+                # Exibição da Tabela
+                st.dataframe(df, use_container_width=True)
+                
+                # Preparação do Excel
+                buf = io.BytesIO()
+                with pd.ExcelWriter(buf, engine='openpyxl') as writer:
+                    df.to_excel(writer, index=False, sheet_name='Enderecos_WMS')
+                
+                st.download_button(
+                    label="📥 Baixar Lista de Endereços",
+                    data=buf.getvalue(),
+                    file_name=f"enderecos_wms_{u_id[:8]}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+            else:
+                st.warning("⚠️ Nenhum endereço encontrado para esta Unidade ID.")
